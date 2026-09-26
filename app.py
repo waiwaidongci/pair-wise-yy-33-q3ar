@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Grid outage restoration planning, field-report merge and status publishing demo."""
+"""Grid outage restoration planning, field-report merge/correction and status publishing demo."""
 from __future__ import annotations
 
 import argparse
@@ -60,13 +60,19 @@ class Store:
         CREATE TABLE IF NOT EXISTS confirmations (
           id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES plans(id), step_no INTEGER NOT NULL,
           status TEXT NOT NULL CHECK(status IN ('confirmed','blocked')), confirmed_by TEXT NOT NULL, confirmed_at TEXT NOT NULL,
-          note TEXT, UNIQUE(plan_id,step_no)
+          note TEXT, report_id INTEGER REFERENCES field_reports(id),
+          state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','invalidated')),
+          invalidated_at TEXT, invalidation_reason TEXT, UNIQUE(plan_id,step_no)
         );
         CREATE TABLE IF NOT EXISTS field_reports (
-          id INTEGER PRIMARY KEY AUTOINCREMENT, client_report_id TEXT UNIQUE NOT NULL, plan_id INTEGER NOT NULL REFERENCES plans(id),
+          id INTEGER PRIMARY KEY AUTOINCREMENT, client_report_id TEXT NOT NULL, plan_id INTEGER NOT NULL REFERENCES plans(id),
           step_no INTEGER NOT NULL, expected_plan_version INTEGER NOT NULL, status TEXT NOT NULL,
           note TEXT, merge_status TEXT NOT NULL CHECK(merge_status IN ('merged','conflict','protected')),
-          conflict_reason TEXT, reported_by TEXT NOT NULL, received_at TEXT NOT NULL
+          conflict_reason TEXT, reported_by TEXT NOT NULL, received_at TEXT NOT NULL,
+          report_version INTEGER NOT NULL DEFAULT 1,
+          record_state TEXT NOT NULL DEFAULT 'current' CHECK(record_state IN ('current','archived')),
+          corrects_report_id INTEGER REFERENCES field_reports(id),
+          UNIQUE(client_report_id,report_version)
         );
         CREATE TABLE IF NOT EXISTS telemetry (
           id INTEGER PRIMARY KEY AUTOINCREMENT, asset_id INTEGER NOT NULL REFERENCES assets(id), load_mw REAL NOT NULL,
@@ -82,7 +88,38 @@ class Store:
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
         """)
+        self.migrate()
         self.conn.commit()
+
+    def migrate(self) -> None:
+        report_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(field_reports)")}
+        if report_cols and "report_version" not in report_cols:
+            self.conn.executescript("""
+            PRAGMA foreign_keys=OFF;
+            ALTER TABLE field_reports RENAME TO field_reports_legacy;
+            CREATE TABLE field_reports (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, client_report_id TEXT NOT NULL, plan_id INTEGER NOT NULL REFERENCES plans(id),
+              step_no INTEGER NOT NULL, expected_plan_version INTEGER NOT NULL, status TEXT NOT NULL,
+              note TEXT, merge_status TEXT NOT NULL CHECK(merge_status IN ('merged','conflict','protected')),
+              conflict_reason TEXT, reported_by TEXT NOT NULL, received_at TEXT NOT NULL,
+              report_version INTEGER NOT NULL DEFAULT 1,
+              record_state TEXT NOT NULL DEFAULT 'current' CHECK(record_state IN ('current','archived')),
+              corrects_report_id INTEGER REFERENCES field_reports(id),
+              UNIQUE(client_report_id,report_version)
+            );
+            INSERT INTO field_reports(id,client_report_id,plan_id,step_no,expected_plan_version,status,note,merge_status,conflict_reason,reported_by,received_at)
+              SELECT id,client_report_id,plan_id,step_no,expected_plan_version,status,note,merge_status,conflict_reason,reported_by,received_at FROM field_reports_legacy;
+            DROP TABLE field_reports_legacy;
+            PRAGMA foreign_keys=ON;
+            """)
+        confirmation_cols = {row[1] for row in self.conn.execute("PRAGMA table_info(confirmations)")}
+        if confirmation_cols and "state" not in confirmation_cols:
+            self.conn.executescript("""
+            ALTER TABLE confirmations ADD COLUMN report_id INTEGER REFERENCES field_reports(id);
+            ALTER TABLE confirmations ADD COLUMN state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','invalidated'));
+            ALTER TABLE confirmations ADD COLUMN invalidated_at TEXT;
+            ALTER TABLE confirmations ADD COLUMN invalidation_reason TEXT;
+            """)
 
     def audit(self, actor: str, action: str, entity_type: str, entity_id: object, details: dict) -> None:
         self.conn.execute("INSERT INTO audit_log(at,actor,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)",
@@ -197,7 +234,7 @@ class GridService:
         if base["state"] not in {"approved", "active"}: raise ApiError(409, "只有已批准或执行中的计划可以变更")
         if int(expected_revision) != int(base["revision"]): raise ApiError(409, "计划已被修改，请刷新版本")
         normalized = self._validate_steps(steps)
-        confirmed = {row["step_no"]: row for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? ORDER BY step_no", (base_plan_id,))}
+        confirmed = {row["step_no"]: row for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND state='active' ORDER BY step_no", (base_plan_id,))}
         base_steps = {int(step["seq"]): step for step in json.loads(base["steps_json"])}
         for seq in confirmed:
             if seq not in {int(step["seq"]) for step in normalized} or normalized[[int(x["seq"]) for x in normalized].index(seq)] != base_steps[seq]:
@@ -212,25 +249,64 @@ class GridService:
             self.store.audit(actor, "plan.change_create", "plan", cur.lastrowid, {"base_plan": base_plan_id, "version": version, "carried_confirmations": len(confirmed)})
         return self._plan_dict(self._row("plans", cur.lastrowid))
 
-    def field_report(self, actor: str | None, role: str | None, plan_id: int, step_no: int, client_report_id: str, expected_plan_version: int, status: str, note: str = "") -> dict:
+    def field_report(self, actor: str | None, role: str | None, plan_id: int, step_no: int, client_report_id: str, expected_plan_version: int, status: str, note: str = "", report_version: int = 1) -> dict:
         actor = self._actor(actor, role, {"field"})
         if status not in {"started", "completed", "blocked"}: raise ApiError(400, "现场状态不合法")
+        report_version = int(report_version)
+        if report_version < 1: raise ApiError(400, "报告版本必须为正整数")
         plan = self._row("plans", plan_id); steps = {int(x["seq"]): x for x in json.loads(plan["steps_json"])}
         if step_no not in steps: raise ApiError(400, "计划中没有该步骤")
-        duplicate = self.conn.execute("SELECT * FROM field_reports WHERE client_report_id=?", (client_report_id,)).fetchone()
-        if duplicate: return dict(duplicate)
+        versions = self.conn.execute("SELECT * FROM field_reports WHERE client_report_id=? ORDER BY report_version", (client_report_id,)).fetchall()
+        if versions:
+            replay = next((row for row in versions if int(row["report_version"]) == report_version), None)
+            if replay: return dict(replay)
+            if report_version < int(versions[-1]["report_version"]): raise ApiError(409, "报告版本已过期，请基于当前版本提交更正")
+            current = next((row for row in reversed(versions) if row["record_state"] == "current"), None)
+            if not current: raise ApiError(409, "原报告缺少当前版本，无法更正")
+            if int(current["plan_id"]) != plan_id or int(current["step_no"]) != step_no:
+                raise ApiError(400, "更正必须针对原报告的计划和步骤")
+            return self._correct_report(actor, plan, current, report_version, expected_plan_version, status, note)
+        if report_version != 1: raise ApiError(400, "首次提交的报告版本必须为1")
         merge_status, conflict = "merged", None
         if plan["state"] != "active": merge_status, conflict = "conflict", "计划尚未激活"
         elif int(expected_plan_version) != int(plan["version"]): merge_status, conflict = "conflict", "现场报告基于旧计划版本"
-        elif self.conn.execute("SELECT id FROM confirmations WHERE plan_id=? AND step_no=?", (plan_id, step_no)).fetchone():
+        elif self.conn.execute("SELECT id FROM confirmations WHERE plan_id=? AND step_no=? AND state='active'", (plan_id, step_no)).fetchone():
             merge_status, conflict = "protected", "已确认记录不能由普通现场报告覆盖"
         with self.conn:
-            cur = self.conn.execute("""INSERT INTO field_reports(client_report_id,plan_id,step_no,expected_plan_version,status,note,merge_status,conflict_reason,reported_by,received_at)
-                                     VALUES(?,?,?,?,?,?,?,?,?,?)""", (client_report_id, plan_id, step_no, expected_plan_version, status, note, merge_status, conflict, actor, now()))
+            cur = self.conn.execute("""INSERT INTO field_reports(client_report_id,plan_id,step_no,expected_plan_version,status,note,merge_status,conflict_reason,reported_by,received_at,report_version,record_state)
+                                     VALUES(?,?,?,?,?,?,?,?,?,?,1,'current')""",
+                                    (client_report_id, plan_id, step_no, expected_plan_version, status, note, merge_status, conflict, actor, now()))
             if merge_status == "merged" and status in {"completed", "blocked"}:
                 self.store.audit(actor, "field_report.merged", "plan", plan_id, {"step_no": step_no, "status": status, "client_report_id": client_report_id})
             self.store.audit(actor, "field_report.received", "plan", plan_id, {"step_no": step_no, "merge_status": merge_status, "conflict": conflict})
         return dict(self._row("field_reports", cur.lastrowid))
+
+    def _correct_report(self, actor: str, plan: sqlite3.Row, current: sqlite3.Row, report_version: int, expected_plan_version: int, status: str, note: str) -> dict:
+        plan_id, step_no = int(current["plan_id"]), int(current["step_no"])
+        merge_status, conflict = "merged", None
+        if plan["state"] != "active": merge_status, conflict = "conflict", "计划尚未激活"
+        elif int(expected_plan_version) != int(plan["version"]): merge_status, conflict = "conflict", "更正基于过期计划版本"
+        with self.conn:
+            cur = self.conn.execute("""INSERT INTO field_reports(client_report_id,plan_id,step_no,expected_plan_version,status,note,merge_status,conflict_reason,reported_by,received_at,report_version,record_state,corrects_report_id)
+                                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    (current["client_report_id"], plan_id, step_no, expected_plan_version, status, note, merge_status, conflict, actor, now(),
+                                     report_version, "current" if merge_status == "merged" else "archived", current["id"]))
+            report_id = cur.lastrowid
+            invalidated = None
+            if merge_status == "merged":
+                self.conn.execute("UPDATE field_reports SET record_state='archived' WHERE id=?", (current["id"],))
+                confirmation = self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND step_no=? AND state='active'", (plan_id, step_no)).fetchone()
+                if confirmation:
+                    reason = f"现场报告 {current['client_report_id']} v{report_version} 更正作废原结论"
+                    self.conn.execute("UPDATE confirmations SET state='invalidated',invalidated_at=?,invalidation_reason=? WHERE id=?", (now(), reason, confirmation["id"]))
+                    invalidated = confirmation["id"]
+                    self.store.audit(actor, "confirmation.invalidate", "plan", plan_id, {"step_no": step_no, "confirmation_id": confirmation["id"], "client_report_id": current["client_report_id"]})
+                self.store.audit(actor, "field_report.corrected", "plan", plan_id, {"client_report_id": current["client_report_id"], "step_no": step_no,
+                                 "from_version": current["report_version"], "to_version": report_version, "status": status, "invalidated_confirmation": invalidated})
+            self.store.audit(actor, "field_report.received", "plan", plan_id, {"step_no": step_no, "merge_status": merge_status, "conflict": conflict, "correction": True})
+        result = dict(self._row("field_reports", report_id))
+        result["invalidated_confirmation_id"] = invalidated
+        return result
 
     def confirm_step(self, actor: str | None, role: str | None, plan_id: int, step_no: int, decision: str, note: str = "") -> dict:
         actor = self._actor(actor, role, {"dispatcher"})
@@ -239,16 +315,18 @@ class GridService:
         if plan["state"] != "active": raise ApiError(409, "只有执行中的计划可以确认")
         steps = {int(x["seq"]): x for x in json.loads(plan["steps_json"])}
         if step_no not in steps: raise ApiError(400, "计划中没有该步骤")
-        report = self.conn.execute("SELECT * FROM field_reports WHERE plan_id=? AND step_no=? AND merge_status='merged' ORDER BY id DESC LIMIT 1", (plan_id, step_no)).fetchone()
+        report = self.conn.execute("""SELECT * FROM field_reports WHERE plan_id=? AND step_no=? AND merge_status='merged' AND record_state='current'
+                                    ORDER BY id DESC LIMIT 1""", (plan_id, step_no)).fetchone()
         if not report: raise ApiError(409, "没有可确认的现场报告")
         if decision == "confirmed" and report["status"] != "completed": raise ApiError(409, "现场步骤尚未完成")
         for dependency in steps[step_no].get("depends_on", []):
-            found = self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND step_no=? AND status='confirmed'", (plan_id, int(dependency))).fetchone()
+            found = self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND step_no=? AND status='confirmed' AND state='active'", (plan_id, int(dependency))).fetchone()
             if not found: raise ApiError(409, f"前置步骤 {dependency} 尚未确认")
         with self.conn:
-            self.conn.execute("""INSERT INTO confirmations(plan_id,step_no,status,confirmed_by,confirmed_at,note) VALUES(?,?,?,?,?,?)
-                               ON CONFLICT(plan_id,step_no) DO UPDATE SET status=excluded.status,confirmed_by=excluded.confirmed_by,confirmed_at=excluded.confirmed_at,note=excluded.note""",
-                              (plan_id, step_no, decision, actor, now(), note))
+            self.conn.execute("""INSERT INTO confirmations(plan_id,step_no,status,confirmed_by,confirmed_at,note,report_id,state) VALUES(?,?,?,?,?,?,?,'active')
+                               ON CONFLICT(plan_id,step_no) DO UPDATE SET status=excluded.status,confirmed_by=excluded.confirmed_by,confirmed_at=excluded.confirmed_at,note=excluded.note,
+                               report_id=excluded.report_id,state='active',invalidated_at=NULL,invalidation_reason=NULL""",
+                              (plan_id, step_no, decision, actor, now(), note, report["id"]))
             self.store.audit(actor, "plan.confirm_step", "plan", plan_id, {"step_no": step_no, "status": decision, "note": note})
         return dict(self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND step_no=?", (plan_id, step_no)).fetchone())
 
@@ -257,17 +335,27 @@ class GridService:
         plan = self._row("plans", plan_id); outage = self._row("outages", outage_id)
         if plan["outage_id"] != outage_id: raise ApiError(400, "计划不属于该事故")
         confirmations = {row["step_no"]: dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=?", (plan_id,))}
+        active = {step_no: row for step_no, row in confirmations.items() if row["state"] == "active"}
+        invalidated = [row for row in confirmations.values() if row["state"] == "invalidated"]
         steps = json.loads(plan["steps_json"])
-        completed = sum(1 for step in steps if confirmations.get(int(step["seq"]), {}).get("status") == "confirmed")
+        completed = sum(1 for step in steps if active.get(int(step["seq"]), {}).get("status") == "confirmed")
+        state = "restored" if completed == len(steps) else "restoring"
+        if state == "restored" and invalidated: raise ApiError(409, "存在失效确认，不能发布完成")
         status = {"outage_id": outage_id, "incident_code": outage["incident_code"], "plan_id": plan_id, "plan_version": plan["version"],
-                  "state": "restored" if completed == len(steps) else "restoring", "completed_steps": completed, "total_steps": len(steps),
-                  "critical_blocked": [x for x in confirmations.values() if x["status"] == "blocked"]}
+                  "state": state, "completed_steps": completed, "total_steps": len(steps),
+                  "critical_blocked": [x for x in active.values() if x["status"] == "blocked"],
+                  "invalidated_confirmations": len(invalidated), "blocking_reasons": self._blocking_reasons(plan_id)}
         with self.conn:
             cur = self.conn.execute("INSERT INTO published_status(outage_id,plan_id,version,status_json,created_at) VALUES(?,?,?,?,?)",
                                     (outage_id, plan_id, plan["version"], j(status), now()))
             if status["state"] == "restored": self.conn.execute("UPDATE outages SET state='restored',revision=revision+1,updated_at=? WHERE id=?", (now(), outage_id))
             self.store.audit(actor, "status.publish", "outage", outage_id, {"plan_id": plan_id, "state": status["state"]})
         return {"id": cur.lastrowid, "status": status}
+
+    def _blocking_reasons(self, plan_id: int) -> list[dict]:
+        return [{"type": "invalidated_confirmation", "step_no": row["step_no"],
+                 "reason": row["invalidation_reason"] or "确认已失效", "detail": "收到新的现场完成报告后才能重新确认"}
+                for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? AND state='invalidated' ORDER BY step_no", (plan_id,))]
 
     def _validate_steps(self, steps: list[dict]) -> list[dict]:
         if not steps: raise ApiError(400, "恢复计划至少需要一个步骤")
@@ -311,8 +399,17 @@ class GridService:
 
     def plan_detail(self, plan_id: int) -> dict:
         plan = self._plan_dict(self._row("plans", plan_id))
+        reports = [dict(row) for row in self.conn.execute("SELECT * FROM field_reports WHERE plan_id=? ORDER BY client_report_id, report_version, id", (plan_id,))]
+        chains: dict[str, list[dict]] = {}
+        for report in reports: chains.setdefault(report["client_report_id"], []).append(report)
+        correction_chains = []
+        for client_report_id, versions in chains.items():
+            if len(versions) < 2: continue
+            current = next((v for v in reversed(versions) if v["record_state"] == "current"), versions[-1])
+            correction_chains.append({"client_report_id": client_report_id, "step_no": current["step_no"],
+                                      "current_version": current["report_version"], "versions": versions})
         return {"plan": plan, "confirmations": [dict(row) for row in self.conn.execute("SELECT * FROM confirmations WHERE plan_id=? ORDER BY step_no", (plan_id,))],
-                "field_reports": [dict(row) for row in self.conn.execute("SELECT * FROM field_reports WHERE plan_id=? ORDER BY id", (plan_id,))]}
+                "field_reports": reports, "correction_chains": correction_chains, "blocking_reasons": self._blocking_reasons(plan_id)}
 
     def _outage_dict(self, row: sqlite3.Row) -> dict:
         return {"id": row["id"], "incident_code": row["incident_code"], "title": row["title"], "state": row["state"],
@@ -374,7 +471,7 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "approve": out = self.service.approve_plan(actor, role, int(p[2]), int(b.get("expected_revision", -1)), b.get("note", ""))
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "activate": out = self.service.activate_plan(actor, role, int(p[2]), int(b.get("expected_revision", -1)))
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "change": out = self.service.make_plan_change(actor, role, int(p[2]), b.get("steps", []), int(b.get("expected_revision", -1)))
-            elif p == ["api", "field-reports"]: out = self.service.field_report(actor, role, int(b.get("plan_id", 0)), int(b.get("step_no", 0)), b.get("client_report_id", ""), int(b.get("expected_plan_version", 0)), b.get("status", ""), b.get("note", ""))
+            elif p == ["api", "field-reports"]: out = self.service.field_report(actor, role, int(b.get("plan_id", 0)), int(b.get("step_no", 0)), b.get("client_report_id", ""), int(b.get("expected_plan_version", 0)), b.get("status", ""), b.get("note", ""), int(b.get("report_version", 1) or 1))
             elif len(p) == 4 and p[:2] == ["api", "plans"] and p[3] == "confirm": out = self.service.confirm_step(actor, role, int(p[2]), int(b.get("step_no", 0)), b.get("decision", "confirmed"), b.get("note", ""))
             elif p == ["api", "status"]: out = self.service.publish_status(actor, role, int(b.get("outage_id", 0)), int(b.get("plan_id", 0)))
             else: raise ApiError(404, "接口不存在")

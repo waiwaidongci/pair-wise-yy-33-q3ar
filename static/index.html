@@ -1,1 +1,17 @@
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、异常遥测隔离和状态发布。</p><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre><script>async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}loadState()</script></html>
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>电网恢复调度</title><style>body{font:16px system-ui;max-width:1100px;margin:32px auto;padding:0 20px}pre{background:#f3f5f7;padding:16px;overflow:auto}button{padding:8px 14px}input{padding:6px}section{margin-top:24px}table{border-collapse:collapse;margin:8px 0 16px}td,th{border:1px solid #d0d7de;padding:4px 10px;font-size:14px;text-align:left}.bad{color:#b42318}.ok{color:#067647}</style><h1>电网事故应急与恢复调度</h1><p>停运事件、安全约束恢复计划、重要用户、离线上报合并、现场更正、异常遥测隔离和状态发布。</p><section><h2>计划详情</h2><input id="planId" type="number" min="1" placeholder="计划 ID"> <button onclick="loadPlan()">查询详情</button><div id="planDetail"></div></section><section><h2>全局状态</h2><button onclick="loadState()">刷新状态</button><pre id="state">加载中...</pre></section><script>
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+async function loadState(){state.textContent=JSON.stringify(await (await fetch('/api/state')).json(),null,2)}
+async function loadPlan(){
+  const id=planId.value;if(!id)return;
+  const d=await (await fetch('/api/plans/'+id)).json();
+  if(d.error){planDetail.innerHTML='<p class="bad">'+esc(d.error)+'</p>';return}
+  let h='<h3>计划 #'+d.plan.id+'（版本 v'+d.plan.version+'，状态 '+esc(d.plan.state)+'）</h3>';
+  h+='<h3>步骤确认</h3>';
+  h+=d.confirmations.length?'<table><tr><th>步骤</th><th>结论</th><th>效力</th><th>确认人</th><th>失效原因</th></tr>'+d.confirmations.map(c=>'<tr><td>'+c.step_no+'</td><td>'+esc(c.status)+'</td><td class="'+(c.state==='active'?'ok':'bad')+'">'+(c.state==='active'?'有效':'已失效')+'</td><td>'+esc(c.confirmed_by)+'</td><td>'+esc(c.invalidation_reason||'')+'</td></tr>').join('')+'</table>':'<p>暂无确认</p>';
+  h+='<h3>更正链</h3>';
+  h+=d.correction_chains.length?d.correction_chains.map(ch=>'<p><b>'+esc(ch.client_report_id)+'</b>（步骤 '+ch.step_no+'，当前版本 v'+ch.current_version+'）</p><table><tr><th>版本</th><th>现场状态</th><th>合并结果</th><th>记录</th><th>冲突原因</th><th>上报人</th><th>时间</th></tr>'+ch.versions.map(v=>'<tr><td>v'+v.report_version+'</td><td>'+esc(v.status)+'</td><td>'+esc(v.merge_status)+'</td><td class="'+(v.record_state==='current'?'ok':'')+'">'+(v.record_state==='current'?'当前':'留档')+'</td><td>'+esc(v.conflict_reason||'')+'</td><td>'+esc(v.reported_by)+'</td><td>'+esc(v.received_at)+'</td></tr>').join('')+'</table>').join(''):'<p>暂无更正</p>';
+  h+='<h3>阻断原因</h3>';
+  h+=d.blocking_reasons.length?'<ul>'+d.blocking_reasons.map(b=>'<li class="bad">步骤 '+b.step_no+'：'+esc(b.reason)+'（'+esc(b.detail)+'）</li>').join('')+'</ul>':'<p class="ok">无阻断</p>';
+  planDetail.innerHTML=h;
+}
+loadState()</script>

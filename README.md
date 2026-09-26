@@ -18,10 +18,10 @@ python3 app.py
 - `POST /api/telemetry`：记录并隔离错误遥测。
 - `POST /api/plans`、`/submit`、`/approve`、`/activate`：创建、提交、审批并启用安全恢复计划。
 - `POST /api/plans/{id}/change`：在不修改已确认步骤的前提下创建新计划版本。
-- `POST /api/field-reports`：合并现场离线报告，重复客户端编号不会重复写入。
-- `POST /api/plans/{id}/confirm`：调度员确认步骤，依赖未满足时拒绝。
-- `POST /api/status`：发布当前恢复状态。
-- `GET /api/plans/{id}`、`GET /api/state`、`GET /api/health`：详情、状态和健康检查。
+- `POST /api/field-reports`：合并现场离线报告，重复客户端编号不会重复写入。携带原客户端编号和更大的 `report_version` 即为更正：原版本留档（`record_state=archived`）、新版本成为当前状态；基于过期计划版本的更正记为 `conflict` 且不改现有结论。
+- `POST /api/plans/{id}/confirm`：调度员确认步骤，依赖未满足时拒绝。更正生效会使旧确认失效并退出完成数，收到新的完成报告后才能重新确认。
+- `POST /api/status`：发布当前恢复状态，仍有失效确认的事故不能发布完成。
+- `GET /api/plans/{id}`、`GET /api/state`、`GET /api/health`：详情（含更正链 `correction_chains` 与阻断原因 `blocking_reasons`）、状态和健康检查。
 
 ## 测试
 
