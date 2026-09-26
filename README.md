@@ -19,9 +19,10 @@ python3 app.py
 - `POST /api/plans`、`/submit`、`/approve`、`/activate`：创建、提交、审批并启用安全恢复计划。
 - `POST /api/plans/{id}/change`：在不修改已确认步骤的前提下创建新计划版本。
 - `POST /api/field-reports`：合并现场离线报告，重复客户端编号不会重复写入。
+- `POST /api/field-reports/{原报告编号}/corrections`：现场纠错，原记录留档，新报告版本成为当前状态；携带过期计划版本的更正返回冲突且不改变现有结论；被推翻的确认失效并退出完成数，收到新完成报告后才能重新确认，仍有失效确认的事故不能发布完成。
 - `POST /api/plans/{id}/confirm`：调度员确认步骤，依赖未满足时拒绝。
 - `POST /api/status`：发布当前恢复状态。
-- `GET /api/plans/{id}`、`GET /api/state`、`GET /api/health`：详情、状态和健康检查。
+- `GET /api/plans/{id}`、`GET /api/state`、`GET /api/health`：详情（含更正链与阻断原因）、状态和健康检查。
 
 ## 测试
 
